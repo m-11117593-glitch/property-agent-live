@@ -45,7 +45,7 @@ const BASE = (() => {
       "VITE_API_BASE_URL is not set. Configure it in your production env.",
     );
   }
-  return "http://localhost:8000/api/v1";
+  return "https://property-agent-backend-qxfa.onrender.com";
 })();
 
 export function getApiBaseUrl(): string {
