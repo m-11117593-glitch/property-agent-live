@@ -4,7 +4,7 @@ WORKDIR /app
 
 RUN apt-get update && apt-get install -y \
     wget curl \
-    libglib2.0-0 libnss3 libgconf-2-4 \
+    libglib2.0-0 libnss3 \
     libx11-xcb1 libxcomposite1 libxcursor1 \
     libxdamage1 libxi6 libxtst6 \
     libatk1.0-0 libgtk-3-0 libasound2 \
