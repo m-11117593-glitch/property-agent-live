@@ -1,0 +1,281 @@
+"""
+Seeder & realtime fetch orchestrator.
+
+Functions:
+- ensure_region(region): if longterm CSV already at MAX_PER_REGION → skip.
+  Otherwise top up per-type using cross-type back-fill policy (A).
+  Returns dict {type_key: count_now, "total": N, "skipped": bool}.
+
+- fetch_realtime_into_tempo(session_id, regions): scrape live, write to tempo
+  JSON keyed by region+session_id, plus append-only into long-term CSV.
+  Persists partial results: every successful per-type scrape is appended to
+  both stores BEFORE moving on, so a later failure does not lose earlier work.
+
+- load_demo_into_tempo(session_id, regions): copy from long-term CSV into the
+  same tempo JSON shape (no network).
+
+- run_with_retry_then_demo(coro_factory, retries=3): runs the supplied async
+  coroutine; on three consecutive failures it switches to demo and sets the
+  global `forced_demo` flag.
+"""
+from __future__ import annotations
+import asyncio
+import logging
+from typing import Awaitable, Callable, Dict, List, Optional
+
+from . import storage
+from .types_quota import (
+    MAX_PER_REGION, MY_REGIONS, TYPE_QUOTA,
+)
+from .mudah_scraper import scrape_region_type, BUDGET as _URL_BUDGET
+
+# Realtime mode hard cap: stop scraping once this many listing URLs have
+# been collected (across all regions/types) and hand off to ranking.
+REALTIME_URL_CAP = 100
+
+logger = logging.getLogger(__name__)
+
+# Per-region type concurrency: how many (type) scrapes for a single region we
+# run in parallel. Each scrape_region_type call already has its own per-host
+# semaphore, so this is an outer fan-out cap.
+REGION_TYPE_CONCURRENCY = 3
+
+
+# ── global degradation flag (module-level singleton) ──────────────────
+class _Flags:
+    forced_demo: bool = False
+    last_error: Optional[str] = None
+
+FLAGS = _Flags()
+
+
+def reset_flags() -> None:
+    FLAGS.forced_demo = False
+    FLAGS.last_error = None
+
+
+# ── long-term seeder ──────────────────────────────────────────────────
+async def ensure_region(region: str) -> Dict:
+    """Top up a region's long-term CSV to MAX_PER_REGION. Skip if already full."""
+    existing = storage.load_longterm(region)
+    if len(existing) >= MAX_PER_REGION:
+        return {"region": region, "skipped": True, "total": len(existing)}
+
+    by_type_now: Dict[str, int] = {t: 0 for t in TYPE_QUOTA}
+    for r in existing:
+        t = r.get("property_type")
+        if t in by_type_now:
+            by_type_now[t] += 1
+
+    # Pass 1: hit each type's nominal quota.
+    for type_key, quota in TYPE_QUOTA.items():
+        deficit = quota - by_type_now[type_key]
+        if deficit <= 0:
+            continue
+        try:
+            rows = await scrape_region_type(region, type_key, deficit)
+        except Exception as e:
+            logger.warning("[seed] %s/%s scrape raised: %r", region, type_key, e)
+            rows = []
+        written = storage.append_longterm(region, rows)
+        by_type_now[type_key] += written
+        logger.info("[seed] %s/%s scraped=%d written=%d", region, type_key, len(rows), written)
+
+    # Pass 2: cross-type back-fill if total still under MAX_PER_REGION.
+    total_now = sum(by_type_now.values())
+    if total_now < MAX_PER_REGION:
+        remaining = MAX_PER_REGION - total_now
+        for type_key in sorted(TYPE_QUOTA, key=lambda k: -TYPE_QUOTA[k]):
+            if remaining <= 0:
+                break
+            try:
+                rows = await scrape_region_type(region, type_key, remaining)
+            except Exception as e:
+                logger.warning("[seed-backfill] %s/%s raised: %r", region, type_key, e)
+                rows = []
+            written = storage.append_longterm(region, rows)
+            by_type_now[type_key] += written
+            remaining -= written
+
+    return {
+        "region": region,
+        "skipped": False,
+        "total": sum(by_type_now.values()),
+        "by_type": by_type_now,
+    }
+
+
+async def ensure_all_regions(regions: Optional[List[str]] = None) -> List[Dict]:
+    regions = regions or MY_REGIONS
+    results = []
+    for r in regions:
+        try:
+            results.append(await ensure_region(r))
+        except Exception as e:  # pragma: no cover
+            logger.exception("ensure_region(%s) failed", r)
+            results.append({"region": r, "error": str(e)})
+    return results
+
+
+# ── demo / realtime → tempo ───────────────────────────────────────────
+def load_demo_into_tempo(session_id: str, regions: List[str]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for region in regions:
+        rows = storage.load_longterm(region)
+        storage.write_tempo(region, session_id, rows)
+        counts[region] = len(rows)
+    return counts
+
+
+async def _scrape_one_type_persist(
+    region: str,
+    session_id: str,
+    type_key: str,
+    quota: int,
+    *,
+    filters: Optional[Dict] = None,
+) -> int:
+    """Scrape one type, persist into long-term CSV AND session tempo. Returns rows scraped.
+
+    When `filters` is supplied (live mode), it is forwarded to scrape_region_type
+    so that the Mudah URL carries min_price/max_price/bedrooms and the keyword
+    override. Filters do NOT alter persistence semantics (long-term CSV is still
+    append-only and authoritative).
+    """
+    try:
+        rows = await scrape_region_type(region, type_key, quota, filters=filters)
+    except Exception as e:
+        logger.warning("[realtime] %s/%s scrape raised: %r", region, type_key, e)
+        return 0
+    if not rows:
+        return 0
+    storage.append_longterm(region, rows)
+    storage.append_tempo(region, session_id, rows)
+    return len(rows)
+
+
+async def fetch_realtime_into_tempo(
+    session_id: str,
+    regions: List[str],
+    *,
+    live_filter: Optional[Dict] = None,
+) -> Dict[str, int]:
+    """
+    Scrape each region live. Types within a region run concurrently (bounded
+    by REGION_TYPE_CONCURRENCY). After each region we re-snapshot tempo from
+    the union of (just-scraped rows ∪ pre-existing long-term CSV) so the
+    ranking agent always sees the freshest data even on partial failure.
+
+    Realtime mode is capped at REALTIME_URL_CAP listing URLs total: once the
+    cap is reached, remaining regions are skipped and the ranking agent is
+    invoked on whatever has been collected so far.
+
+    `live_filter` (optional) tightens the scrape to the user's brief:
+      - house_type → scrape ONLY that single type (quota=MAX_PER_REGION),
+        instead of fanning out across all TYPE_QUOTA entries.
+      - keyword / bedrooms / min_price / max_price → forwarded into the
+        Mudah URL via mudah_scraper._build_search_url.
+    None / empty filter → original full-type fan-out behaviour.
+
+    If the filtered scrape returns zero rows, the function still re-snapshots
+    tempo from the pre-existing long-term CSV; the upstream expansion_level
+    mechanism (search_pipeline.fetch_raw_properties) is responsible for
+    widening the search when the resulting pool is empty.
+    """
+    counts: Dict[str, int] = {}
+    _URL_BUDGET.init(REALTIME_URL_CAP)
+
+    # Resolve which (type, quota) pairs to scrape per region from the filter.
+    filter_house_type = (live_filter or {}).get("house_type")
+    if filter_house_type and filter_house_type in TYPE_QUOTA:
+        type_plan: List[tuple[str, int]] = [(filter_house_type, MAX_PER_REGION)]
+    else:
+        type_plan = list(TYPE_QUOTA.items())
+
+    try:
+        for region in regions:
+            if _URL_BUDGET.exhausted:
+                # Budget spent: still expose pre-existing long-term data via tempo
+                # so ranking has something to work with for the remaining regions.
+                pre = storage.load_longterm(region)
+                storage.write_tempo(region, session_id, pre)
+                counts[region] = len(pre)
+                continue
+
+            # Initialise tempo with whatever long-term data already exists so a
+            # total scrape failure still produces a usable file.
+            pre = storage.load_longterm(region)
+            storage.write_tempo(region, session_id, pre)
+
+            # NOTE: pre-existing rows in long-term CSV were scraped WITHOUT the
+            # current live filter, so a "long-term cache full" short-circuit
+            # would silently bypass the user's filter requirements. When a live
+            # filter is active we always re-hit Mudah for this region.
+            if not live_filter and storage.longterm_count(region) >= MAX_PER_REGION:
+                counts[region] = len(pre)
+                continue
+
+            sem = asyncio.Semaphore(REGION_TYPE_CONCURRENCY)
+
+            async def _bounded(t: str, q: int, _region: str = region) -> int:
+                # `_region` default-arg captures the loop variable to avoid the
+                # classic late-binding bug when `region` rebinds on next iter.
+                async with sem:
+                    return await _scrape_one_type_persist(
+                        _region, session_id, t, q, filters=live_filter,
+                    )
+
+            results = await asyncio.gather(
+                *[_bounded(t, q) for t, q in type_plan],
+                return_exceptions=True,
+            )
+            total_new = sum(r for r in results if isinstance(r, int))
+
+            # Re-snapshot tempo to the freshest union (CSV is authoritative).
+            rows = storage.load_longterm(region)
+            storage.write_tempo(region, session_id, rows)
+            counts[region] = len(rows)
+            logger.info(
+                "[realtime] %s: +%d new, total=%d, budget_remaining=%d, filter=%s",
+                region, total_new, len(rows), _URL_BUDGET.remaining, live_filter,
+            )
+    finally:
+        # Always disable the budget so non-realtime / subsequent runs are
+        # never accidentally throttled by leftover state.
+        _URL_BUDGET.disable()
+
+    return counts
+
+
+# ── retry orchestrator ────────────────────────────────────────────────
+async def run_with_retry_then_demo(
+    realtime_coro: Callable[[], Awaitable[Dict[str, int]]],
+    demo_coro:     Callable[[], Dict[str, int]],
+    *,
+    retries: int = 3,
+) -> Dict[str, int]:
+    """
+    Tries realtime up to `retries` times. On three consecutive failures, falls
+    back to demo and sets FLAGS.forced_demo = True so the frontend can show a
+    popup via /api/v1/system_status.
+
+    A realtime attempt that returns an empty dict OR a dict whose values are
+    all zero is treated as a failed attempt — otherwise a silently-banned
+    scrape would be reported as success and the frontend would never know.
+    """
+    last_err: Optional[str] = None
+    for attempt in range(1, retries + 1):
+        try:
+            res = await realtime_coro()
+            if res and any(v > 0 for v in res.values()):
+                return res
+            last_err = f"attempt {attempt}: empty result {res!r}"
+            logger.warning("[scraper] realtime empty %s", last_err)
+        except Exception as e:
+            last_err = f"attempt {attempt}: {e!r}"
+            logger.warning("[scraper] realtime failed %s", last_err)
+        await asyncio.sleep(1.0 * attempt)
+    FLAGS.forced_demo = True
+    FLAGS.last_error = last_err
+    logger.error("[scraper] forced DEMO after %d retries: %s", retries, last_err)
+    return demo_coro()
